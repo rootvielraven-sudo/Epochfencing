@@ -1,0 +1,7 @@
+# Pipeline distribuido de reconstrucción de facturas + VERA (Python 3.11+)
+ray[default]==2.60.0
+jsonschema==4.26.0
+PyYAML==6.0.3
+reportlab==5.1.0
+redis==8.1.0
+pytest==9.2.0

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.venv311/
+data/
+.pytest_cache/
+.idea/
+# LaTeX auxiliares (se conserva informe.pdf y los .tex)
+informe/*.aux
+informe/*.log
+informe/*.out
+informe/*.fls
+informe/*.fdb_latexmk
+informe/*.synctex.gz

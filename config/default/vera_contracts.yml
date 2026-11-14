@@ -1,0 +1,132 @@
+# VERA — contratos por tipo de documento.
+# Mapea doc_type -> entidades con su familia (SemanticType). El LLM NUNCA ve el tipo;
+# vive solo en VERA para decidir la canonicalización al anclar contra la fuente.
+#
+# type ∈ number | currency_amount | percentage | date | period | identifier |
+#        enum | text_anchored | text
+# fmt (solo identifier) ∈ iban | cuit | cuil | nif | cif   (habilita checksum)
+# params opcionales: currency (currency_amount), locale (date/period), page,
+#                    optional, enum:[...], aliases:[...]
+#
+# Además de `entities`, un doc_type puede declarar un bloque OPCIONAL `calc` para la
+# dimensión de CONSISTENCIA DE CÁLCULO (opt-in VERA_CALC=on): verifica invariantes
+# aritméticos (línea, subtotal, IVA, total) entre las entidades numéricas. Sus claves
+# apuntan a la EXTRACCIÓN (lo que devuelve el LLM), no a los `name` de arriba. Ver el
+# ejemplo en `factura`. Sin bloque `calc` → la dimensión queda inerte para ese tipo.
+#
+# ⚠️ PLANTILLAS. Los campos reales de cada tipo documental los define el dominio del
+# cliente (nombres/alias exactos como aparecen en el doc, qué es requerido, divisa, etc.).
+# Revisar y ajustar ANTES de activar VERA_ENGINE=minerva en producción. Los nombres deben
+# coincidir (por nombre o alias) con las etiquetas reales del documento para que anclen.
+
+# ── Factura electrónica ───────────────────────────────────────────────────────
+factura:
+  entities:
+    - {name: "Total a pagar", type: currency_amount, currency: ARS, aliases: ["Total", "Importe total", "Neto a pagar"]}
+    - {name: "Subtotal",      type: currency_amount, currency: ARS, aliases: ["Subtotal gravado"]}
+    - {name: "Importe IVA",   type: currency_amount, currency: ARS, aliases: ["Monto IVA"]}
+    - {name: "Alícuota IVA",    type: percentage, aliases: ["Alícuota", "Tasa IVA"]}
+    - {name: "Fecha de emisión", type: date, locale: es-AR}
+    - {name: "CUIT emisor",     type: identifier, fmt: cuit, aliases: ["Razón Social"]}
+    - {name: "Comprobante",   type: identifier, aliases: ["Nro de comprobante", "Nro comprobante", "Número"]}
+  # ── Dimensión de CONSISTENCIA DE CÁLCULO (opt-in: VERA_CALC=on) ─────────────
+  # ⚠️ Las claves de ABAJO son claves de la EXTRACCIÓN (lo que devuelve el LLM en el
+  # resultado), NO los `name` de `entities`. Se resuelven case-insensitive. AJUSTALAS a
+  # las claves REALES que produce tu config del Extractor para este tipo (sobre todo el
+  # array de líneas y sus sub-claves: dependen 100% de tu plantilla de extracción).
+  # Valores en string es-AR ("$ 1.234,56", "21%") — los parsea el canonicalizador de VERA.
+  # Un invariante sin datos queda INCOMPLETE (no inventa). Probar en SOMBRA y medir antes
+  # de flipear VERA_CALC_MODE=authoritative (que degrada el estado ante inconsistencia).
+  calc:
+    lines:
+      array: "items"            # clave del array de líneas (p.ej. items / detalle / renglones / facturas)
+      qty: "cantidad"           # cantidad de la línea
+      price: "precio_unitario"  # precio unitario
+      amount: "importe"         # importe de la línea  (invariante: cantidad * precio = importe)
+      # discount: "descuento"   # (opcional) descuento de línea: cantidad*precio - descuento = importe
+    subtotal: "subtotal"        # (invariante: Σ importe - descuento_bloque + recargo = subtotal)
+    # discount:  "descuento"    # (opcional) descuento de bloque
+    # surcharge: "recargo"      # (opcional) recargo de bloque
+    total: "total"              # (invariante: Σ(base + cuota) - retención = total)
+    # retention: "retencion"    # (opcional) retención
+    taxes:                      # uno o más tramos impositivos (invariante: base * tasa = cuota)
+      - {base: "base_imponible", rate: "alicuota_iva", amount: "importe_iva", id: "iva"}
+      # Varias alícuotas (una factura puede tener 21% y 10,5%):
+      # - {base: "base_imponible_105", rate: "alicuota_105", amount: "iva_105", id: "iva_10_5"}
+
+# ── Traslado de residuos RD 553/2020 (DI/CT/DCS) — documentos REALES ──────────
+residuos:
+  entities:
+    - {name: "Nº DI",          type: identifier, aliases: ["Nº Documento de Identificación", "Número de Documento de Identificación"]}
+    - {name: "Nº NT",          type: identifier, aliases: ["Nº de Notificación Previa", "Número de Notificación"]}
+    - {name: "Nº DA",          type: identifier}
+    - {name: "Nº CT",          type: identifier, aliases: ["Nº Contrato de Tratamiento"]}
+    - {name: "Fecha",          type: date, locale: es-AR, aliases: ["Fecha inicio de traslado", "Fecha de inicio del traslado"]}
+    - {name: "CIF/NIF",        type: identifier, aliases: ["CIF", "NIF", "C.I.F.", "N.I.F."]}
+    - {name: "NIMA",           type: identifier}
+    - {name: "CP",             type: identifier, aliases: ["Código Postal"]}
+    - {name: "Teléfono",       type: identifier, aliases: ["Tel", "Teléfono/FAX"]}
+    - {name: "Nº Inscripción", type: identifier, aliases: ["Nº inscripción Registro de PyGR", "Nº Inscripción Registro"]}
+
+# ── Recibo de pago (AR/ES) — contrato DERIVADO DEL DOMINIO ────────────────────
+# Campos y etiquetas de un recibo de pago típico, con alias ricos para anclar contra variantes
+# reales. NO validado aún contra los recibos del cliente: activarlo en modo SOMBRA sobre tráfico
+# real, medir review-rate, ajustar alias con los que NO anclen, y recién ahí flipear a autoritativo.
+recibo:
+  entities:
+    - {name: "Recibo Nº", type: identifier,
+       aliases: ["Recibo N", "Recibo Nro", "Recibo Nro.", "Nº de recibo", "Número de recibo",
+                 "Nro recibo", "Comprobante", "Nº comprobante", "Nº"]}
+    - {name: "Fecha", type: date, locale: es-AR,
+       aliases: ["Fecha de emisión", "Fecha de pago", "Fecha de recibo"]}
+    - {name: "Importe", type: currency_amount, currency: ARS,
+       aliases: ["Monto", "Total", "Importe total", "La suma de", "La cantidad de",
+                 "Recibí la suma de", "Recibí de", "Son", "Neto"]}
+    - {name: "CUIT", type: identifier, fmt: cuit, optional: true,
+       aliases: ["CUIL", "C.U.I.T.", "C.U.I.L.", "CUIT/CUIL"]}
+    - {name: "Concepto", type: text_anchored, optional: true,
+       aliases: ["En concepto de", "Concepto de pago", "Detalle", "Por"]}
+    - {name: "Forma de pago", type: enum, optional: true,
+       enum: ["Efectivo", "Cheque", "Transferencia", "Tarjeta", "Débito", "Mercado Pago"],
+       aliases: ["Medio de pago", "Modo de pago", "Pago"]}
+
+# ── Receta médica (PLANTILLA) ─────────────────────────────────────────────────
+receta_medica:
+  entities:
+    - {name: "Dosis",           type: number, aliases: ["Dosificación"]}
+    - {name: "Fecha",           type: date, locale: es-AR}
+    - {name: "Matrícula",       type: identifier, aliases: ["Matrícula profesional"]}
+    - {name: "Medicamento",     type: text_anchored, optional: true}
+
+# ── Nómina / recibo de sueldo (PLANTILLA) ─────────────────────────────────────
+nomina:
+  entities:
+    - {name: "Neto a cobrar",   type: currency_amount, currency: ARS, aliases: ["Neto"]}
+    - {name: "Bruto",           type: currency_amount, currency: ARS, optional: true}
+    - {name: "Período",         type: period, aliases: ["Período liquidado"]}
+    - {name: "CUIL",            type: identifier, fmt: cuil}
+  # ── Dimensión de CONSISTENCIA DE CÁLCULO (opt-in: VERA_CALC=on) ─────────────
+  # Recibo de sueldo: Bruto/Remunerativo - Σdeducciones = Neto, con chequeo POR-CONCEPTO.
+  # `deductions` RESTA (al revés que `taxes`, que suma): cada concepto verifica base*tasa=monto
+  # (Jubilación 11%, Ley 19032 3%, Obra Social 3% sobre el remunerativo) y su monto baja el neto.
+  # Claves = las de TU extracción (ajustar), valores string es-AR. Si un concepto es monto fijo
+  # (sin tasa), poné solo `amount` (cuenta para la suma, no se chequea base*tasa).
+  calc:
+    subtotal: "remunerativo"       # base de aportes (alias: "Remunerativo", "Sujeto a retención")
+    total: "neto"                  # neto a cobrar  (invariante: remunerativo - Σdeducciones = neto)
+    # retention: "otras_retenciones"   # (opcional) retención de monto fijo que también resta
+    deductions:
+      - {base: "remunerativo", rate: "alic_jubilacion",  amount: "jubilacion",   id: "jubilacion"}
+      - {base: "remunerativo", rate: "alic_ley_19032",   amount: "ley_19032",    id: "ley_19032"}
+      - {base: "remunerativo", rate: "alic_obra_social", amount: "obra_social",  id: "obra_social"}
+    # Opcional: si la extracción trae los HABERES como array, verificar Σhaberes = remunerativo:
+    # lines: {array: "haberes", qty: "cantidad", price: "importe_unitario", amount: "importe"}
+
+# ── Documento bancario (PLANTILLA) ────────────────────────────────────────────
+documento_bancario:
+  entities:
+    - {name: "Saldo",     type: currency_amount, currency: ARS, aliases: ["Saldo final"]}
+    - {name: "CBU",       type: identifier, aliases: ["CBU/IBAN"]}
+    - {name: "IBAN",      type: identifier, fmt: iban, optional: true}
+    - {name: "Fecha",     type: date, locale: es-AR}
+    - {name: "Período",   type: period, optional: true}
