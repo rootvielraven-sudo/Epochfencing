@@ -5,6 +5,47 @@ caída de nodos sin perder ni duplicar**. Al final, un verificador determinista 
 actúa como **compuerta**: solo lo que avala entra al PDF como *verificado*; lo demás entra
 con su OCR crudo y **marcado** (`DEGRADED`).
 
+> ### Epoch fencing — la pieza central (de ahí el nombre del repo)
+> Cada intento de procesamiento de una factura lleva un número de **epoch** monotónico. El
+> *store* valida ese epoch contra el estado **durable** (disco), bajo un lock de fichero
+> (`flock`) que serializa a todos los procesos, y **fusiona la comprobación del token con la
+> escritura en una sola operación atómica** (sin TOCTOU entre procesos). Eso es lo que
+> convierte la reclamación de trabajo tras una caída en **exactly-once *effect***: un worker
+> "zombi" que se daba por muerto, revive y escribe tarde **no puede pisar** el resultado
+> bueno —su epoch quedó obsoleto y la escritura se rechaza—. La garantía correcta es
+> *at-least-once execution* + *exactly-once effect*, **no** *exactly-once processing*.
+
+## Qué hicimos y cómo
+
+Partimos de dos trabajos propios —**LLM-GSR** (reconstrucción) y **VERA** (verificación)— y
+construimos encima una capa de **resiliencia ante fallos** y una **auditoría experimental
+honesta**:
+
+1. **Recuperación ante caídas.** Cada factura es una tarea atómica con un *lease* que vence:
+   si un nodo cae, la factura sin confirmar se reclama y se reejecuta en otro worker. El
+   **epoch fencing** (arriba) hace que la reejecución no duplique ni corrompa el resultado.
+2. **VERA como compuerta.** Un verificador determinista decide qué entra al PDF como
+   *verificado*. Dos dimensiones ortogonales: **cobertura** (¿cada valor ancla en la fuente?
+   → atrapa **alucinaciones**) y **cálculo** (¿se cumplen los invariantes aritméticos? →
+   atrapa **corrupción silenciosa**).
+3. **Tres modos de reconstrucción** con interfaz común: *oracle* (baseline), *conservador*
+   (conserva lo legible, abstiene lo ilegible con `[UNRECOVERABLE]`) y **LLM-GSR real**
+   (backend local `qwen3.5:35b` vía Ollama). Los modos productivos **no acceden a la verdad**
+   (verificado por test → sin fuga de ground truth en inferencia).
+4. **Fortalecimiento honesto.** Estresamos VERA con **10 familias adversariales** (importe
+   inventado pero aritméticamente consistente, CUIT válido incorrecto, valor de otro
+   documento, línea omitida, etc.) y la verificamos contra una **fuente independiente** (el
+   OCR degradado, no un texto derivado de la verdad). Hallazgo central: el *100 % / 0 FP* del
+   baseline **depende de la fuente privilegiada** —es casi circular—; con una fuente
+   independiente la **cobertura deja de ser compuerta dura** (falso-rechazo alto sobre entrada
+   ruidosa) y el **cálculo**, robusto, caza solo rupturas aritméticas. Medimos además calidad
+   real del LLM (recupera de verdad pero alucina más al degradarse el OCR) y calibración (el
+   modelo está sobreconfiado → la abstención estructural es la palanca efectiva).
+
+Todo reproducible: semillas fijas, salidas en `data/`, **385 tests** (`385 passed, 1
+skipped`) y el informe LaTeX compilado (`informe/informe.pdf`, §Fortalecimiento). Las
+métricas completas están en `RESULTS.md`.
+
 Reutiliza dos trabajos propios (en `trabajo/`):
 - **LLM-GSR** (`llm_guide.pdf`): reconstrucción de OCR degradado como predicción de
   secuencia, paralelizada sobre Ray (*Pure Dispatcher*), con la **Precondición de
@@ -85,6 +126,11 @@ inyectamos nosotros, tenemos la verdad de referencia sin anotación manual. Medi
 detección, falsos positivos y falsos negativos. Resultado típico: **con VERA** detección
 ≈1.0, FP=0, FN=0; **sin VERA** detección 0, todas las malas entran al PDF.
 
+> ⚠️ **Salvedad de honestidad:** ese *100 % / 0 FP* se mide contra una **fuente privilegiada**
+> (texto limpio derivado de la verdad) y por tanto es casi circular. El *fortalecimiento*
+> (`exp3`, fuente independiente = OCR degradado) muestra el costo real: la cobertura ya no es
+> compuerta dura y solo el cálculo se mantiene robusto. Ver §"Qué hicimos y cómo" y `RESULTS.md`.
+
 ## Corpus: sintético o REAL
 
 Por defecto el corpus es sintético (facturas es-AR generadas de forma determinista). Con
@@ -122,9 +168,13 @@ framework/vera/        VERA (verificador determinista, port de producción)
 config/default/        vera_contracts.yml (contrato del doc_type 'factura')
 pipeline/
   corpus.py            genera facturas (truth + OCR degradado + texto reconstruido)
-  reconstructor.py     LLM-GSR determinista (temp 0, semilla por (id, epoch)), sentinel
+  reconstructor.py     3 modos: oracle, conservador y LLM-GSR real (interfaz común, sentinel)
+  domain_context.py    contexto de dominio φ (esquema del doc_type desde el contrato VERA)
+  llm_client.py        cliente LLM (OpenAI gpt-4o / Ollama local; key solo en runtime)
+  abstention.py        política de abstención (confianza + evidencia); encuadre de I(ĉ;s)
+  adversarial.py       10 familias de fallos adversariales para estresar a VERA
   leases.py            cola con leases → recuperación ante caída de nodo
-  store.py             store atómico con epoch fencing → rechazo de zombis
+  store.py             store atómico con epoch fencing durable (flock, sin TOCTOU)
   gate.py              compuerta VERA (cobertura → alucinación; cálculo → corrupción)
   faults.py            inyección: caída de nodo, corrupción, alucinación
   orchestrator.py      ejecutor local determinista (motor de métricas)
@@ -133,7 +183,8 @@ pipeline/
   mika_env.py          carga el .env de mika (Redis, flags VERA) — privado
   redis_store.py       store con epoch fencing EN REDIS (CAS atómico vía Lua)
   pdf.py               PDF final (verificadas + degradadas marcadas)
-experiments/           exp1_node_crash.py · exp2_content.py
+experiments/           exp1_node_crash · exp2_content · exp2_real (calidad LLM-GSR)
+                       exp3_vera_adversarial (10 familias) · exp4_abstention (τ/calibración)
 run.py                 CLI
 ```
 
