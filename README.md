@@ -5,8 +5,74 @@ caída de nodos sin perder ni duplicar**. Al final, un verificador determinista 
 actúa como **compuerta**: solo lo que avala entra al PDF como *verificado*; lo demás entra
 con su OCR crudo y **marcado** (`DEGRADED`).
 
+## En palabras simples (glosario)
+
+> Si algún término te resulta nuevo, acá está en criollo. El resto del README asume estas
+> definiciones. Si ya los conocés, saltealo.
+
+**El problema**
+- **OCR**: el software que "lee" una imagen y la convierte en texto. A baja resolución se
+  equivoca: parte palabras, confunde caracteres, rompe números. El resultado es una **factura
+  degradada**.
+- **Reconstrucción (LLM-GSR)**: usar un modelo de lenguaje para *recuperar con fundamento* el
+  texto original a partir del degradado. Como cuando leés un cartel borroso y tu cabeza
+  completa las letras que faltan.
+- **Ground truth** (verdad de referencia): el dato correcto de verdad. Lo conocemos porque
+  nosotros generamos las facturas. Sirve para *corregir el examen, no para rendirlo*: el
+  modelo **nunca** lo ve.
+- **Alucinación**: cuando el modelo, en vez de reconstruir, **inventa** un valor que *parece*
+  plausible pero no está en la fuente. Es el fallo más peligroso porque pasa desapercibido.
+
+**Sistemas distribuidos y resiliencia** (repartir el trabajo entre muchos procesos y
+sobrevivir a que alguno falle)
+- **Nodo / worker**: uno de los procesos que hace el trabajo. **Ray** es la librería que los
+  coordina y reparte las facturas.
+- **Caída (crash)**: un worker se muere a mitad de una factura. El objetivo es no perderla.
+- **Lease** (arrendamiento): un "préstamo con vencimiento" de la factura a un worker. Si no la
+  termina y confirma antes de que venza, otro worker la agarra. Como una reserva que se libera
+  sola si no la usás.
+- **Zombi**: un worker que se daba por muerto pero seguía vivo y escribe **tarde**, con datos
+  viejos. El peligro: que pise el resultado bueno.
+- **Epoch**: un número de intento que sube cada vez (1, 2, 3…). Dice "esta escritura es del
+  intento N".
+- **Epoch fencing** (lo que da nombre al repo): la regla de que *solo se acepta la escritura
+  del epoch más nuevo*. El zombi llega con un epoch viejo → se rechaza. (*fencing* = "poner
+  una cerca" alrededor del dato bueno.)
+- **Durable**: guardado en disco de verdad, sobrevive a un reinicio (≠ en memoria, que se
+  pierde al caer).
+- **Atómico / TOCTOU**: una operación **atómica** pasa entera o no pasa, sin estados a medias.
+  **TOCTOU** (*time-of-check to time-of-use*) es el bug de "chequeo y después uso, pero entre
+  medio algo cambió"; lo evitamos uniendo chequeo + escritura en un solo paso atómico.
+- **at-least-once / exactly-once effect**: el trabajo puede ejecutarse *más de una vez* (por
+  reintentos), pero el **resultado final** queda como si se hubiera hecho *exactamente una
+  vez*, sin duplicados. Es la garantía honesta que da este sistema.
+
+**Verificación (VERA)**
+- **VERA**: un verificador **determinista** (reglas fijas; mismo dato de entrada → mismo
+  veredicto). **No es otra IA**: por eso sus decisiones son auditables y repetibles.
+- **Compuerta (gate)**: VERA decide quién pasa. Lo que avala entra al PDF como *verificado*;
+  lo que no, entra marcado como `DEGRADED` (con su OCR crudo, visible pero sin "sello").
+- **Cobertura**: ¿cada valor que reporta el modelo *aparece anclado* en el texto fuente? Si no
+  aparece, es probable alucinación (veredicto `INVENTED`).
+- **Cálculo**: ¿las cuentas cierran? (p. ej. Σ líneas = total, IVA coherente). Atrapa números
+  bien formados pero que **no cuadran** = *corrupción silenciosa*.
+- **Abstención** / `[UNRECOVERABLE]`: que el modelo diga "no sé" en vez de inventar.
+  Abstenerse es mejor que alucinar.
+- **Fuente privilegiada vs. independiente**: si VERA verifica contra un texto *derivado de la
+  verdad*, se está "haciendo trampa sola" (es **circular**) y da 100 %. Contra una fuente
+  **independiente** (el OCR real que vio el modelo) aparece el costo honesto.
+- **Calibración**: ¿la confianza que reporta el modelo coincide con cuánto acierta? Si dice
+  "99 % seguro" y se equivoca igual, está **mal calibrado**.
+- **Falso positivo (FP) / falso negativo (FN)**: FP = rechazar una factura buena; FN = dejar
+  pasar una mala. El FN es el caro: un dato inventado que llega al PDF sin que nadie lo note.
+
 > ### Epoch fencing — la pieza central (de ahí el nombre del repo)
-> Cada intento de procesamiento de una factura lleva un número de **epoch** monotónico. El
+> **En una frase:** si un proceso "zombi" revive y quiere guardar un resultado viejo, el
+> sistema lo rechaza porque su número de intento (*epoch*) quedó atrasado. Así una factura
+> reprocesada tras una caída nunca termina duplicada ni pisada.
+>
+> **En detalle:** cada intento de procesamiento de una factura lleva un número de **epoch**
+> monotónico (que solo sube). El
 > *store* valida ese epoch contra el estado **durable** (disco), bajo un lock de fichero
 > (`flock`) que serializa a todos los procesos, y **fusiona la comprobación del token con la
 > escritura en una sola operación atómica** (sin TOCTOU entre procesos). Eso es lo que
